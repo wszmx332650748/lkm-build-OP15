@@ -1,0 +1,14 @@
+# Kernel module build outputs
+*.ko
+*.o
+*.mod
+*.mod.c
+*.cmd
+*.order
+*.symvers
+.tmp_versions/
+
+# Packaged demo artifacts
+out/
+*.zip
+

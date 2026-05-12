@@ -20,7 +20,7 @@
 #include <linux/uaccess.h>
 
 /* ---------- module parameter ---------- */
-static char *target_path = "/data/nohello";
+static char *target_path = "/data/local/tmp/nohello";
 module_param(target_path, charp, 0644);
 MODULE_PARM_DESC(target_path, "Absolute path to hide");
 
@@ -83,11 +83,14 @@ static int getattr_exit(struct kretprobe_instance *ri, struct pt_regs *regs)
 }
 
 /* ---------- __arm64_sys_getdents64 ---------- */
+#define GETDENTS_BUF_LIMIT 65536u
+
 static struct kretprobe kp_getdents;
 
 struct getdents_cb_data {
 	struct linux_dirent64 __user *dirent;
 	void *kbuf;
+	size_t kbuf_len;
 };
 
 /*
@@ -99,14 +102,26 @@ static int getdents_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	struct getdents_cb_data *d = (struct getdents_cb_data *)ri->data;
 	struct pt_regs *user_regs = (struct pt_regs *)regs->regs[0];
-	unsigned int count = (unsigned int)user_regs->regs[2];
+	unsigned int count;
 
+	d->dirent = NULL;
+	d->kbuf = NULL;
+	d->kbuf_len = 0;
+
+	if (!user_regs)
+		return 0;
+
+	count = (unsigned int)user_regs->regs[2];
 	d->dirent = (struct linux_dirent64 __user *)user_regs->regs[1];
 
 	/* Guard against excessively large allocations */
-	count = min(count, 65536u);
+	count = min(count, GETDENTS_BUF_LIMIT);
+	if (!count)
+		return 0;
 
 	d->kbuf = kmalloc(count, GFP_KERNEL);
+	if (d->kbuf)
+		d->kbuf_len = count;
 	return 0;
 }
 
@@ -118,9 +133,17 @@ static int getdents_exit(struct kretprobe_instance *ri, struct pt_regs *regs)
 	long remain, new_len;
 	const size_t hdr_off = offsetof(struct linux_dirent64, d_name);
 	const size_t min_reclen = offsetof(struct linux_dirent64, d_name) + 1;
+	bool removed = false;
 
 	if (ret <= 0 || !d->dirent || !d->kbuf)
 		goto out;
+
+	if ((size_t)ret > d->kbuf_len) {
+		pr_debug_ratelimited("nohello: getdents return too large "
+				     "(%ld > %zu), skip filtering\n",
+				     ret, d->kbuf_len);
+		goto out;
+	}
 
 	if (copy_from_user(d->kbuf, d->dirent, ret))
 		goto out;
@@ -135,11 +158,9 @@ static int getdents_exit(struct kretprobe_instance *ri, struct pt_regs *regs)
 	       remain >= (long)src->d_reclen) {
 
 		if (src->d_ino == (__u64)target_ino) {
-			/* Remove this entry: shift remaining data over it */
 			long skip = src->d_reclen;
-			long tail = remain - skip;
-			if (tail > 0)
-				memmove(dst, (char *)src + skip, tail);
+
+			removed = true;
 			remain -= skip;
 			src = (struct linux_dirent64 *)((char *)src + skip);
 			continue;
@@ -152,9 +173,15 @@ static int getdents_exit(struct kretprobe_instance *ri, struct pt_regs *regs)
 		src = (struct linux_dirent64 *)((char *)src + src->d_reclen);
 	}
 
+	if (removed && remain > 0) {
+		if (dst != src)
+			memmove(dst, src, remain);
+		dst = (struct linux_dirent64 *)((char *)dst + remain);
+	}
+
 	new_len = (long)((char *)dst - (char *)kbuf);
 
-	if (new_len < ret) {
+	if (removed && new_len < ret) {
 		if (copy_to_user(d->dirent, kbuf, new_len))
 			pr_warn_ratelimited("nohello: copy_to_user failed, "
 					    "directory may leak\n");
@@ -165,6 +192,7 @@ static int getdents_exit(struct kretprobe_instance *ri, struct pt_regs *regs)
 out:
 	kfree(d->kbuf);
 	d->kbuf = NULL;
+	d->kbuf_len = 0;
 	return 0;
 }
 

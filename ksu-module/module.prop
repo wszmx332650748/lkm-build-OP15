@@ -1,0 +1,7 @@
+id=nohello-demo
+name=NoHello Demo
+version=1.0.0
+versionCode=1
+author=lkm-build
+description=Loads nohello.ko and hides the path configured in target_path.conf.
+
