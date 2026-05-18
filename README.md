@@ -45,9 +45,9 @@ Implemented:
 - Migrates old `/data/adb/nohello` config on first PathMask boot.
 - Provides a KernelSU WebUI with config editing, health checks, paged logs, and
   one-click diagnostic report copying.
-- Avoids direct `kern_path()` / `path_put()` usage. Target resolution uses
-  `filp_open()` / `filp_close()` so OEM kernels that prune unused
-  `kern_path/path_put` exports are less likely to reject the module.
+- Avoids importing `kern_path()` / `path_put()` directly. Target resolution
+  resolves those helper addresses through kprobes so OEM kernels that prune
+  unused VFS helper exports are less likely to reject the module.
 
 Known limitations:
 

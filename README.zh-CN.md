@@ -126,7 +126,9 @@ grep '^pathmask ' /proc/modules
 
 ### 3. Unknown symbol / Invalid module format
 
-通常是 `.ko` 和设备内核 KMI 不匹配，或者厂商内核裁剪了符号。请换对应 KMI 的 Release 包。
+通常是 `.ko` 和设备内核 KMI 不匹配，或者厂商内核裁剪了符号。请先换对应 KMI 的 Release 包。
+
+如果日志里出现 `Unknown symbol filp_open`，说明你使用的是旧版 PathMask 包，请更新到新版 Release。
 
 ### 4. 黑名单模式不生效
 

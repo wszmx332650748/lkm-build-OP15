@@ -502,15 +502,17 @@ ls -l ${shellQuote(MODDIR)} 2>/dev/null || true
 ls -l ${shellQuote(LEGACY_MODDIR)} 2>/dev/null || true
 echo '--- sysfs parameters ---'
 for f in /sys/module/pathmask/parameters/*; do [ -f "$f" ] && echo "$(basename "$f")=$(cat "$f" 2>/dev/null)"; done
+true
 `);
 
 	const configLog = await safeExec(`
 echo '--- persistent config ---'
-for f in ${shellQuote(CONFIGDIR)}/*.conf; do [ -f "$f" ] && echo "### $f" && cat "$f"; done
+for f in ${shellQuote(CONFIGDIR)}/*.conf; do [ -f "$f" ] && echo "### $f" && cat "$f" && echo; done
 echo '--- legacy config ---'
-for f in ${shellQuote(LEGACY_CONFIGDIR)}/*.conf; do [ -f "$f" ] && echo "### $f" && cat "$f"; done
+for f in ${shellQuote(LEGACY_CONFIGDIR)}/*.conf; do [ -f "$f" ] && echo "### $f" && cat "$f" && echo; done
 echo '--- target existence ---'
 if [ -f ${shellQuote(files.targets)} ]; then while IFS= read -r p || [ -n "$p" ]; do [ -z "$p" ] && continue; case "$p" in \\#*) continue;; esac; if [ -e "$p" ]; then echo "OK $p"; else echo "MISS $p"; fi; done < ${shellQuote(files.targets)}; fi
+true
 `);
 
 	const scriptLog = await safeExec(`logcat -d -s pathmask nohello 2>/dev/null | tail -n 300 || true`);

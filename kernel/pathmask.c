@@ -4,9 +4,8 @@
  *
  * The module stores target identities as (dev, inode) pairs and makes matching
  * paths appear absent to selected UIDs or globally. Target resolution uses
- * filp_open()/filp_close() instead of kern_path()/path_put() because some OEM
- * stock kernels prune unused EXPORT_SYMBOL entries for kern_path/path_put from
- * the final binary.
+ * kprobe-resolved kern_path()/path_put() pointers so the .ko does not import
+ * OEM-pruned VFS helper exports directly.
  */
 
 #include <linux/module.h>
@@ -15,9 +14,9 @@
 #include <linux/cred.h>
 #include <linux/dcache.h>
 #include <linux/err.h>
-#include <linux/file.h>
-#include <linux/fcntl.h>
 #include <linux/fs.h>
+#include <linux/namei.h>
+#include <linux/path.h>
 #include <linux/version.h>
 #include <linux/dirent.h>
 #include <linux/slab.h>
@@ -75,6 +74,54 @@ static unsigned int target_count;
 static enum pathmask_scope_mode active_scope = SCOPE_GLOBAL;
 static uid_t deny_uid_list[MAX_DENY_UIDS];
 static unsigned int deny_uid_count;
+
+typedef int (*pm_kern_path_t)(const char *name, unsigned int flags,
+			      struct path *path);
+typedef void (*pm_path_put_t)(const struct path *path);
+
+static pm_kern_path_t pm_kern_path;
+static pm_path_put_t pm_path_put;
+
+static unsigned long resolve_kernel_symbol_addr(const char *symbol_name)
+{
+	struct kprobe kp = {
+		.symbol_name = symbol_name,
+	};
+	unsigned long addr;
+	int ret;
+
+	ret = register_kprobe(&kp);
+	if (ret) {
+		pr_warn(PM_LOG_PREFIX "resolve %s failed: %d\n",
+			symbol_name, ret);
+		return 0;
+	}
+
+	addr = (unsigned long)kp.addr;
+	unregister_kprobe(&kp);
+
+	if (!addr)
+		pr_warn(PM_LOG_PREFIX "resolve %s returned NULL\n",
+			symbol_name);
+
+	return addr;
+}
+
+static int resolve_path_helpers(void)
+{
+	if (!pm_kern_path)
+		pm_kern_path = (pm_kern_path_t)
+			resolve_kernel_symbol_addr("kern_path");
+	if (!pm_path_put)
+		pm_path_put = (pm_path_put_t)
+			resolve_kernel_symbol_addr("path_put");
+
+	if (!pm_kern_path || !pm_path_put)
+		return -ENOENT;
+
+	pr_info(PM_LOG_PREFIX "resolved VFS path helpers via kprobe\n");
+	return 0;
+}
 
 static inline bool is_target_inode(const struct inode *inode)
 {
@@ -215,7 +262,7 @@ static int parse_deny_uids(void)
 
 static int add_target_path(const char *path_name)
 {
-	struct file *file;
+	struct path path;
 	struct inode *inode;
 	int ret;
 
@@ -224,19 +271,19 @@ static int add_target_path(const char *path_name)
 		return -ENOSPC;
 	}
 
-	file = filp_open(path_name, O_PATH | O_CLOEXEC, 0);
-	if (IS_ERR(file))
-		file = filp_open(path_name, O_RDONLY | O_CLOEXEC, 0);
-	if (IS_ERR(file)) {
-		ret = PTR_ERR(file);
-		pr_warn(PM_LOG_PREFIX "%s not found/openable (err=%d), skip\n",
+	if (!pm_kern_path || !pm_path_put)
+		return -ENOENT;
+
+	ret = pm_kern_path(path_name, LOOKUP_FOLLOW, &path);
+	if (ret) {
+		pr_warn(PM_LOG_PREFIX "%s not found (err=%d), skip\n",
 			path_name, ret);
 		return ret;
 	}
 
-	inode = file_inode(file);
+	inode = d_inode(path.dentry);
 	if (!inode || !inode->i_sb) {
-		filp_close(file, NULL);
+		pm_path_put(&path);
 		pr_warn(PM_LOG_PREFIX "%s has no inode, skip\n", path_name);
 		return -ENOENT;
 	}
@@ -250,7 +297,7 @@ static int add_target_path(const char *path_name)
 		MAJOR(targets[target_count].dev),
 		MINOR(targets[target_count].dev));
 	target_count++;
-	filp_close(file, NULL);
+	pm_path_put(&path);
 
 	return 0;
 }
@@ -457,6 +504,13 @@ static int __init pathmask_init(void)
 	if (ret)
 		return ret;
 
+	ret = resolve_path_helpers();
+	if (ret) {
+		pr_err(PM_LOG_PREFIX "could not resolve VFS path helpers (err=%d)\n",
+		       ret);
+		return ret;
+	}
+
 	ret = resolve_target_paths(paths);
 	if (ret) {
 		pr_err(PM_LOG_PREFIX "no valid targets (err=%d)\n", ret);
@@ -537,8 +591,3 @@ module_exit(pathmask_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("lkm-build");
 MODULE_DESCRIPTION("Selective path masking demo via kretprobes");
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
-MODULE_IMPORT_NS("VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver");
-#else
-MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);
-#endif
