@@ -136,6 +136,29 @@ grep '^pathmask ' /proc/modules
 
 如果日志里出现 `Unknown symbol filp_open`，说明你使用的是旧版 PathMask 包，请更新到新版 Release。
 
+### 4. disagrees about version of symbol module_layout
+
+这是 OEM 内核（小米澎湃 / vivo OriginOS 等）启用了 modversions 严格校验的表现。内核要求加载的 `.ko` 里每个引用符号的 CRC 必须和内核内置的完全一致。
+
+PathMask 发布的通用 Release 包是用 Google GKI 公版头文件编译的，CRC 跟 OEM 定制内核不一定对得上。如果你看到这条错误：
+
+```text
+pathmask: disagrees about version of symbol module_layout
+insmod: failed to load pathmask.ko: Exec format error
+```
+
+说明你的设备内核跟发布的 ko 不兼容。**模块不会加载，但也不会导致重启**。
+
+解决办法：
+
+1. 联系开发者确认是否有你设备的专版 ko（从厂商开源内核源码编译）。
+2. 如果你有能力，可以自己用厂商开源内核源码编译一份专属 ko（参考下方"自己从源码编译"段落）。
+3. 如果以上都不可行，当前版本暂不支持你的设备，请卸载模块。
+
+已确认受影响的设备：
+
+- 小米 13 Ultra (ishtar) — OS3.0.303 / 5.15.178-android13-8
+
 ### 4. 黑名单模式不生效
 
 检查 UID 是否解析到了：
@@ -256,3 +279,43 @@ Windows PowerShell：
 ```powershell
 .\tools\package_ksu.ps1 -KoPath .\kernel\pathmask.ko -Output .\out\pathmask-ksu.zip -TargetPath "/dev/scene,/system_ext/app/SoterService"
 ```
+
+## 自己从源码编译（解决 OEM 内核兼容性）
+
+如果你的设备遇到 `disagrees about version of symbol module_layout`，可以用厂商开源的内核源码自己编一份精确兼容的 ko。
+
+前提：
+
+- Linux 环境（WSL2 / Ubuntu / Debian 均可）
+- 厂商开源内核源码（如 MiCode/Xiaomi_Kernel_OpenSource 对应分支）
+- Google AOSP prebuilt clang（跟你设备内核 banner 里的 clang 版本一致）
+
+步骤概要：
+
+```sh
+# 1. 克隆厂商内核源码
+git clone --depth=1 -b <你设备的分支> <厂商内核仓库> kernel-source
+
+# 2. 配置 + 禁 LTO（避免内存爆炸）
+cd kernel-source
+make ARCH=arm64 LLVM=1 gki_defconfig
+./scripts/config --file .config -d LTO_CLANG -d LTO_CLANG_THIN -e LTO_NONE -d CFI_CLANG
+make ARCH=arm64 LLVM=1 olddefconfig
+
+# 3. 编到 vmlinux.symvers 出来即可（不需要完整 vmlinux）
+make ARCH=arm64 LLVM=1 LLVM_IAS=1 -j4 vmlinux
+# 如果 BTF/pahole 报错可以忽略，只要 vmlinux.symvers 产出就行
+
+# 4. 软链 Module.symvers
+ln -sf vmlinux.symvers Module.symvers
+
+# 5. 编 pathmask.ko
+cd /path/to/lkm-build-OP13/kernel
+KDIR=/path/to/kernel-source make ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1
+
+# 6. 验证
+modinfo pathmask.ko | grep vermagic
+llvm-readelf -SW pathmask.ko | grep __versions  # 大小应非零
+```
+
+编出来的 ko 用 `tools/package_ksu.ps1` 打包成 KSU zip 即可安装。
