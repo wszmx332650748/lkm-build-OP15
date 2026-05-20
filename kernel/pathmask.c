@@ -355,15 +355,38 @@ static int resolve_target_paths(const char *paths)
 }
 
 static struct kretprobe kp_inode_perm;
+static atomic_t pm_perm_seen = ATOMIC_INIT(0);
+static atomic_t pm_getattr_seen = ATOMIC_INIT(0);
 
 struct inode_perm_data {
 	unsigned long matched;
 };
 
+/*
+ * Hook inode_permission rather than security_inode_permission. The latter is
+ * a tiny LSM dispatcher that ThinLTO inlines into its callers on Android GKI
+ * 5.15+, leaving the exported symbol live in kallsyms but never actually
+ * called -- the kretprobe would attach but never fire.
+ *
+ * inode_permission's signature differs across kernel versions:
+ *   < 5.12: int inode_permission(struct inode *, int)
+ *   5.12+:  int inode_permission(struct user_namespace *, struct inode *, int)
+ *   6.3+:   int inode_permission(struct mnt_idmap *, struct inode *, int)
+ * which shifts the inode argument from x0 to x1 starting with 5.12.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+#define PM_PERM_INODE_REG 1
+#else
+#define PM_PERM_INODE_REG 0
+#endif
+
 static int perm_inode_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	struct inode_perm_data *d = (struct inode_perm_data *)ri->data;
-	struct inode *inode = (struct inode *)regs->regs[0];
+	struct inode *inode = (struct inode *)regs->regs[PM_PERM_INODE_REG];
+
+	if (atomic_cmpxchg(&pm_perm_seen, 0, 1) == 0)
+		pr_info(PM_LOG_PREFIX "inode_permission hook fired (first time)\n");
 
 	d->matched = should_hide_for_current() && is_target_inode(inode);
 	return 0;
@@ -380,11 +403,21 @@ static int perm_exit(struct kretprobe_instance *ri, struct pt_regs *regs)
 
 static struct kretprobe kp_inode_getattr;
 
+/*
+ * Same reasoning as the perm hook: security_inode_getattr is a tiny LSM
+ * dispatcher inlined by ThinLTO. vfs_getattr is the actual VFS entry point,
+ * exported and large enough that it stays out-of-line. Both functions take
+ * `const struct path *` as the first argument, so the entry handler is
+ * unchanged.
+ */
 static int getattr_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	struct inode_perm_data *d = (struct inode_perm_data *)ri->data;
 	struct path *path = (struct path *)regs->regs[0];
 	struct inode *inode = NULL;
+
+	if (atomic_cmpxchg(&pm_getattr_seen, 0, 1) == 0)
+		pr_info(PM_LOG_PREFIX "vfs_getattr hook fired (first time)\n");
 
 	if (path && path->dentry)
 		inode = d_inode(path->dentry);
@@ -541,7 +574,7 @@ static int __init pathmask_init(void)
 		return ret;
 	}
 
-	kp_inode_perm.kp.symbol_name = "security_inode_permission";
+	kp_inode_perm.kp.symbol_name = "inode_permission";
 	kp_inode_perm.entry_handler = perm_inode_entry;
 	kp_inode_perm.handler = perm_exit;
 	kp_inode_perm.data_size = sizeof(struct inode_perm_data);
@@ -549,13 +582,13 @@ static int __init pathmask_init(void)
 	ret = register_kretprobe(&kp_inode_perm);
 	if (ret) {
 		pr_err(PM_LOG_PREFIX
-		       "register_kretprobe(security_inode_permission) failed: %d\n",
+		       "register_kretprobe(inode_permission) failed: %d\n",
 		       ret);
 		return ret;
 	}
-	pr_info(PM_LOG_PREFIX "hooked security_inode_permission\n");
+	pr_info(PM_LOG_PREFIX "hooked inode_permission\n");
 
-	kp_inode_getattr.kp.symbol_name = "security_inode_getattr";
+	kp_inode_getattr.kp.symbol_name = "vfs_getattr";
 	kp_inode_getattr.entry_handler = getattr_entry;
 	kp_inode_getattr.handler = getattr_exit;
 	kp_inode_getattr.data_size = sizeof(struct inode_perm_data);
@@ -563,12 +596,12 @@ static int __init pathmask_init(void)
 	ret = register_kretprobe(&kp_inode_getattr);
 	if (ret) {
 		pr_err(PM_LOG_PREFIX
-		       "register_kretprobe(security_inode_getattr) failed: %d\n",
+		       "register_kretprobe(vfs_getattr) failed: %d\n",
 		       ret);
 		unregister_kretprobe(&kp_inode_perm);
 		return ret;
 	}
-	pr_info(PM_LOG_PREFIX "hooked security_inode_getattr\n");
+	pr_info(PM_LOG_PREFIX "hooked vfs_getattr\n");
 
 	if (hide_dirents) {
 		kp_getdents.kp.symbol_name = "__arm64_sys_getdents64";

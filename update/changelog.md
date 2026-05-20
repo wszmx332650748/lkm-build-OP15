@@ -1,3 +1,13 @@
+# PathMask 2.2.4
+
+- Fix silent hook miss on Android GKI 5.15+ kernels: `security_inode_permission` and `security_inode_getattr` are tiny LSM dispatchers that ThinLTO inlines into their callers, leaving the exported symbols live in `kallsyms` but never actually called. The kretprobes attached cleanly but never fired, so paths stayed visible even with the module reported as `loaded` and all three hooks reported as `hooked`. Switch to `inode_permission` and `vfs_getattr`, which are large enough that LTO cannot inline them. The `inode_permission` argument register varies by kernel version (`x0` on <5.12, `x1` on 5.12+ where the `user_namespace` / `mnt_idmap` parameter is prepended), handled with a compile-time check.
+- Add a one-shot `pr_info` line the first time each hook actually fires so users can confirm in `dmesg` that the hook is doing real work, not just registered. Look for `pathmask: inode_permission hook fired (first time)` and `pathmask: vfs_getattr hook fired (first time)`.
+
+中文说明：
+
+- 修复 Android GKI 5.15+ 内核上 hook 看似已挂、实际从未触发的问题：`security_inode_permission` / `security_inode_getattr` 是很短的 LSM 分发器，被 ThinLTO 内联进了上层调用者；导出的符号在 `kallsyms` 里仍可见，但内核里没人真正调用它们。kretprobe 注册成功却永远不触发，于是模块明明显示"已加载，三个 hook 都 hooked"，路径却完全没隐藏。改为 hook `inode_permission` 和 `vfs_getattr` —— 这两个函数体足够大，LTO 不会内联。`inode_permission` 在 5.12 之后多了 `user_namespace` / `mnt_idmap` 参数，inode 从 `x0` 移到 `x1`，按内核版本编译期切换。
+- 新增"首次触发日志"：每个 hook 第一次真正被调用时打印一行 `pr_info`。用户可以在 `dmesg` 里搜 `pathmask: inode_permission hook fired (first time)` 和 `pathmask: vfs_getattr hook fired (first time)` 来确认 hook 真的在工作，而不仅仅是注册成功了。
+
 # PathMask 2.2.3
 
 - Fix silent reboot on Android GKI kernels with `CONFIG_CFI_CLANG=y` (e.g. OnePlus 11 android13-5.15) caused by Clang CFI checking the indirect call to kprobe-resolved `kern_path` / `path_put`. The two indirect call sites are now wrapped in `__nocfi` helpers; the rest of the module retains full CFI coverage. Behaviour on OEM kernels that prune `EXPORT_SYMBOL(kern_path)` / `path_put` is unchanged.
