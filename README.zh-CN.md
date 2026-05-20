@@ -136,29 +136,6 @@ grep '^pathmask ' /proc/modules
 
 如果日志里出现 `Unknown symbol filp_open`，说明你使用的是旧版 PathMask 包，请更新到新版 Release。
 
-### 4. disagrees about version of symbol module_layout
-
-这是 OEM 内核（小米澎湃 / vivo OriginOS 等）启用了 modversions 严格校验的表现。内核要求加载的 `.ko` 里每个引用符号的 CRC 必须和内核内置的完全一致。
-
-PathMask 发布的通用 Release 包是用 Google GKI 公版头文件编译的，CRC 跟 OEM 定制内核不一定对得上。如果你看到这条错误：
-
-```text
-pathmask: disagrees about version of symbol module_layout
-insmod: failed to load pathmask.ko: Exec format error
-```
-
-说明你的设备内核跟发布的 ko 不兼容。**模块不会加载，但也不会导致重启**。
-
-解决办法：
-
-1. 联系开发者确认是否有你设备的专版 ko（从厂商开源内核源码编译）。
-2. 如果你有能力，可以自己用厂商开源内核源码编译一份专属 ko（参考下方"自己从源码编译"段落）。
-3. 如果以上都不可行，当前版本暂不支持你的设备，请卸载模块。
-
-已确认受影响的设备：
-
-- 小米 13 Ultra (ishtar) — OS3.0.303 / 5.15.178-android13-8
-
 ### 4. 黑名单模式不生效
 
 检查 UID 是否解析到了：
@@ -280,9 +257,9 @@ Windows PowerShell：
 .\tools\package_ksu.ps1 -KoPath .\kernel\pathmask.ko -Output .\out\pathmask-ksu.zip -TargetPath "/dev/scene,/system_ext/app/SoterService"
 ```
 
-## 自己从源码编译（解决 OEM 内核兼容性）
+## 自己从源码编译
 
-如果你的设备遇到 `disagrees about version of symbol module_layout`，可以用厂商开源的内核源码自己编一份精确兼容的 ko。
+如果发布的 ko 跟你的设备内核不兼容（例如 `disagrees about version of symbol module_layout`），可以用厂商开源的内核源码自己编一份精确兼容的 ko。
 
 前提：
 

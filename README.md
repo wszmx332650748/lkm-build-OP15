@@ -233,38 +233,11 @@ Common failure classes:
 
 - No `pathmask` in `/proc/modules`: boot service skipped or `insmod` failed.
 - `Unknown symbol`: kernel export/KMI mismatch.
-- `disagrees about version of symbol module_layout`: OEM kernel modversions
-  CRC mismatch (see below).
+- `disagrees about version of symbol module_layout`: kernel modversions CRC
+  mismatch; if rebuild is feasible, see "Building from OEM Kernel Source".
 - Empty `deny_uids` in deny mode: package names did not resolve to UIDs.
 - All targets missing at boot: service skips loading.
 - Old `nohello` module loaded: uninstall the old module and reboot.
-
-## OEM Kernel Compatibility
-
-Some OEM kernels (Xiaomi HyperOS / vivo OriginOS / etc.) enforce strict
-modversions CRC validation. The released PathMask `.ko` is built against
-Google GKI headers whose CRCs may not match the OEM kernel's internal
-symbol table. When this happens, `dmesg` reports:
-
-```text
-pathmask: disagrees about version of symbol module_layout
-insmod: failed to load pathmask.ko: Exec format error
-```
-
-**The module will not load, but it will NOT cause a reboot.** This is a
-safe, clean rejection by the kernel.
-
-Known affected devices:
-
-- Xiaomi 13 Ultra (ishtar) — HyperOS 3.0.303 / 5.15.178-android13-8
-
-Workarounds:
-
-1. Ask the developer for a device-specific `.ko` built from the OEM's
-   open-source kernel tree.
-2. Build one yourself (see "Building from OEM Kernel Source" below).
-3. If neither is available, uninstall the module — your device is not
-   currently supported.
 
 ## Building from OEM Kernel Source
 
