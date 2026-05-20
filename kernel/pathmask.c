@@ -71,6 +71,20 @@ struct hidden_target {
 
 static struct hidden_target targets[MAX_HIDE_TARGETS];
 static unsigned int target_count;
+
+/*
+ * Read-only sysfs view of how many target paths the module successfully
+ * resolved at insmod time. Exposed at
+ * /sys/module/pathmask/parameters/resolved_count so that the WebUI health
+ * check can avoid running stat() against the configured paths in global
+ * scope (those calls would now be intercepted by our own syscall hooks
+ * and falsely reported as "missing"). target_count itself is the source
+ * of truth -- module_param_named() simply mirrors it.
+ */
+module_param_named(resolved_count, target_count, uint, 0444);
+MODULE_PARM_DESC(resolved_count,
+		 "Number of target paths successfully resolved at load time");
+
 static enum pathmask_scope_mode active_scope = SCOPE_GLOBAL;
 static uid_t deny_uid_list[MAX_DENY_UIDS];
 static unsigned int deny_uid_count;

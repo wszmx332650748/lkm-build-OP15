@@ -325,6 +325,17 @@ function updateHealthList() {
 
 	if (targets.length === 0) {
 		items.push({ level: "bad", title: "隐藏路径为空", body: "至少保留一个存在的路径，否则模块不会加载。" });
+	} else if (snapshot.targetProbeHidden) {
+		const resolved = Number.isFinite(snapshot.targetResolvedCount) ? snapshot.targetResolvedCount : -1;
+		if (resolved < 0) {
+			items.push({ level: "ok", title: "隐藏路径配置有效", body: `${targets.length} 条路径（global 模式下被自身隐藏，跳过 stat 探测）。` });
+		} else if (resolved === targets.length) {
+			items.push({ level: "ok", title: "隐藏路径配置有效", body: `内核已解析 ${resolved}/${targets.length} 条路径（global 模式下 stat 会被自身拦截，故跳过用户态探测）。` });
+		} else if (resolved === 0) {
+			items.push({ level: "warn", title: "内核未解析到任何路径", body: `配置了 ${targets.length} 条路径但内核加载时全部跳过；可能配置变更后未重启或热重载。` });
+		} else {
+			items.push({ level: "warn", title: "部分路径未解析", body: `内核仅解析了 ${resolved}/${targets.length} 条路径，剩余的在加载时不存在被跳过；查看 dmesg 找具体哪一条。` });
+		}
 	} else if ((snapshot.targetProbe || "").includes("MISS")) {
 		items.push({ level: "warn", title: "有路径当前不存在", body: "不存在的路径会在内核加载时被跳过。" });
 	} else {
@@ -451,6 +462,7 @@ async function refreshConfig() {
 	const moduleText = await safeExec(`grep '^${MODULE_NAME} ' /proc/modules || true`);
 	const legacyModuleText = await safeExec(`grep '^${LEGACY_MODULE_NAME} ' /proc/modules || true`);
 	const sysDenyUids = await safeExec(`[ -f /sys/module/${MODULE_NAME}/parameters/deny_uids ] && cat /sys/module/${MODULE_NAME}/parameters/deny_uids || true`);
+	const sysResolvedCount = await safeExec(`[ -f /sys/module/${MODULE_NAME}/parameters/resolved_count ] && cat /sys/module/${MODULE_NAME}/parameters/resolved_count || true`);
 	const koInfo = await safeExec(`[ -f ${shellQuote(files.ko)} ] && ls -l ${shellQuote(files.ko)} || echo missing`);
 	const moduleFlags = await safeExec(`ls -1 ${shellQuote(MODDIR)}/disable ${shellQuote(MODDIR)}/remove 2>/dev/null || true`);
 	const legacyConfigInfo = await safeExec(`[ -d ${shellQuote(LEGACY_CONFIGDIR)} ] && echo ${shellQuote(LEGACY_CONFIGDIR)} || true`);
@@ -482,6 +494,7 @@ async function refreshConfig() {
 		moduleText,
 		legacyModuleText,
 		sysDenyUids,
+		sysResolvedCount,
 		koInfo,
 		moduleFlags,
 		legacyConfigInfo,
@@ -646,6 +659,36 @@ async function refreshTargetProbe() {
 		return;
 	}
 
+	/*
+	 * In global scope, the module's own syscall hooks intercept stat()
+	 * for every UID -- including this WebUI shell. A direct `[ -e ]`
+	 * probe would falsely report MISS for paths that the kernel actually
+	 * resolved successfully, because that's exactly what global hiding
+	 * does. Skip the stat probe and fall back to the kernel-side
+	 * resolved_count parameter, which is set during insmod (before any
+	 * hook is active) and is the ground truth.
+	 *
+	 * resolved_count tells us how many paths succeeded but not which
+	 * ones, so we can only confidently mark them all OK when the count
+	 * matches the configured list. When it's less, we surface a generic
+	 * "kernel resolved N/M" so the UI no longer blames the wrong cause.
+	 */
+	const loaded = (lastSnapshot.moduleText || "").trim();
+	const scope = (lastSnapshot.scopeText || "").trim();
+	if (loaded && scope === "global") {
+		const resolved = Number.parseInt((lastSnapshot.sysResolvedCount || "").trim(), 10);
+		if (Number.isFinite(resolved) && resolved >= 0) {
+			lastSnapshot.targetProbe = paths.map((path) => (
+				`HIDDEN ${path}`
+			)).join("\n");
+			lastSnapshot.targetProbeHidden = true;
+			lastSnapshot.targetResolvedCount = resolved;
+			return;
+		}
+	}
+	lastSnapshot.targetProbeHidden = false;
+	lastSnapshot.targetResolvedCount = -1;
+
 	const body = paths.map((path) => (
 		`if [ -e ${shellQuote(path)} ]; then echo OK ${shellQuote(path)}; else echo MISS ${shellQuote(path)}; fi`
 	)).join("; ");
@@ -710,12 +753,19 @@ async function validateConfig(options = {}) {
 	}
 
 	await refreshTargetProbe();
-	const probeLines = linesFromText(lastSnapshot.targetProbe || "");
-	const missLines = probeLines.filter((line) => line.startsWith("MISS "));
-	if (paths.length && missLines.length === paths.length) {
-		warnings.push("当前所有隐藏路径都不存在，service.sh 会等待后跳过加载。");
-	} else if (missLines.length) {
-		warnings.push(`${missLines.length} 条隐藏路径当前不存在，内核加载时会跳过这些路径。`);
+	if (lastSnapshot.targetProbeHidden) {
+		const resolved = Number.isFinite(lastSnapshot.targetResolvedCount) ? lastSnapshot.targetResolvedCount : -1;
+		if (resolved >= 0 && resolved < paths.length) {
+			warnings.push(`内核仅解析了 ${resolved}/${paths.length} 条路径（global 模式下 stat 会被自身拦截，跳过用户态校验）。`);
+		}
+	} else {
+		const probeLines = linesFromText(lastSnapshot.targetProbe || "");
+		const missLines = probeLines.filter((line) => line.startsWith("MISS "));
+		if (paths.length && missLines.length === paths.length) {
+			warnings.push("当前所有隐藏路径都不存在，service.sh 会等待后跳过加载。");
+		} else if (missLines.length) {
+			warnings.push(`${missLines.length} 条隐藏路径当前不存在，内核加载时会跳过这些路径。`);
+		}
 	}
 
 	if (scope === "deny" && packages.length) {
@@ -845,7 +895,16 @@ for f in ${shellQuote(CONFIGDIR)}/*.conf; do [ -f "$f" ] && echo "### $f" && cat
 echo '--- legacy config ---'
 for f in ${shellQuote(LEGACY_CONFIGDIR)}/*.conf; do [ -f "$f" ] && echo "### $f" && cat "$f" && echo; done
 echo '--- target existence ---'
-if [ -f ${shellQuote(files.targets)} ]; then while IFS= read -r p || [ -n "$p" ]; do [ -z "$p" ] && continue; case "$p" in \\#*) continue;; esac; if [ -e "$p" ]; then echo "OK $p"; else echo "MISS $p"; fi; done < ${shellQuote(files.targets)}; fi
+if [ -f ${shellQuote(files.targets)} ]; then
+  scope=$(cat ${shellQuote(files.scope)} 2>/dev/null | head -n1 | tr -d ' \\t\\r\\n')
+  loaded=$(grep -c '^${MODULE_NAME} ' /proc/modules 2>/dev/null || echo 0)
+  if [ "$scope" = "global" ] && [ "$loaded" -gt 0 ]; then
+    resolved=$(cat /sys/module/${MODULE_NAME}/parameters/resolved_count 2>/dev/null || echo ?)
+    echo "(scope=global, kernel resolved $resolved target(s); skipping user-space stat probe to avoid self-hide)"
+  else
+    while IFS= read -r p || [ -n "$p" ]; do [ -z "$p" ] && continue; case "$p" in \\#*) continue;; esac; if [ -e "$p" ]; then echo "OK $p"; else echo "MISS $p"; fi; done < ${shellQuote(files.targets)}
+  fi
+fi
 true
 `);
 
