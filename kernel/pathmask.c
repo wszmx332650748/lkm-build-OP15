@@ -492,27 +492,6 @@ struct syscall_match_data {
 	bool needs_close;
 };
 
-enum pm_syscall_kind {
-	PM_SYS_PATHONLY = 0,	/* metadata-only: stat/access/readlink */
-	PM_SYS_OPENAT,		/* openat: filename in regs[1] */
-	PM_SYS_OPENAT2,		/* openat2: filename in regs[1] (same prefix) */
-};
-
-static struct pm_syscall_probe {
-	const char *symbol;
-	enum pm_syscall_kind kind;
-	struct kretprobe rp;
-	bool registered;
-} pm_syscall_probes[] = {
-	{ .symbol = "__arm64_sys_newfstatat", .kind = PM_SYS_PATHONLY },
-	{ .symbol = "__arm64_sys_statx",      .kind = PM_SYS_PATHONLY },
-	{ .symbol = "__arm64_sys_faccessat",  .kind = PM_SYS_PATHONLY },
-	{ .symbol = "__arm64_sys_faccessat2", .kind = PM_SYS_PATHONLY },
-	{ .symbol = "__arm64_sys_readlinkat", .kind = PM_SYS_PATHONLY },
-	{ .symbol = "__arm64_sys_openat",     .kind = PM_SYS_OPENAT  },
-	{ .symbol = "__arm64_sys_openat2",    .kind = PM_SYS_OPENAT2 },
-};
-
 static atomic_t pm_syscall_seen = ATOMIC_INIT(0);
 
 static bool sys_path_matches_target(const char *p)
@@ -537,20 +516,23 @@ static bool sys_path_matches_target(const char *p)
 	return false;
 }
 
-static int sys_path_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
+/*
+ * Shared core: read filename from regs[1], match against targets, return
+ * true if this syscall should be turned into -ENOENT. Called by the two
+ * thin entry handlers below. We avoid container_of(ri->rp, ...) because
+ * `kretprobe_instance` has no portable `rp` field across the 5.10 / 5.15+
+ * KMI lines (5.15 introduced an `rph` indirection and `get_kretprobe()`,
+ * neither exists on 5.10), so each syscall kind gets its own thin entry
+ * handler that just sets `needs_close` correctly.
+ */
+static bool sys_path_match_user_filename(struct pt_regs *regs)
 {
-	struct syscall_match_data *d = (struct syscall_match_data *)ri->data;
 	struct pt_regs *user_regs = (struct pt_regs *)regs->regs[0];
-	struct pm_syscall_probe *p = container_of(ri->rp,
-						  struct pm_syscall_probe, rp);
 	char buf[TARGET_TEXT_LEN];
 	long len;
 
-	d->matched = false;
-	d->needs_close = false;
-
 	if (!user_regs || !should_hide_for_current())
-		return 0;
+		return false;
 
 	/*
 	 * All hooked syscalls share the same prefix:
@@ -560,24 +542,50 @@ static int sys_path_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 	len = strncpy_from_user(buf, (const char __user *)user_regs->regs[1],
 				sizeof(buf));
 	if (len <= 0)
-		return 0;
+		return false;
 	buf[sizeof(buf) - 1] = '\0';
 
-	if (!sys_path_matches_target(buf))
+	return sys_path_matches_target(buf);
+}
+
+static int sys_path_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	struct syscall_match_data *d = (struct syscall_match_data *)ri->data;
+
+	d->matched = false;
+	d->needs_close = false;
+
+	if (!sys_path_match_user_filename(regs))
 		return 0;
 
 	d->matched = true;
-	if (p->kind == PM_SYS_OPENAT || p->kind == PM_SYS_OPENAT2) {
-		/*
-		 * For openat we can only fake -ENOENT if we also have a way
-		 * to release the fd the syscall body just allocated. Without
-		 * close_fd we'd leak; bail out and let the open succeed
-		 * rather than corrupt the fd table.
-		 */
-		if (!pm_close_fd)
-			return 0;
-		d->needs_close = true;
-	}
+	if (atomic_cmpxchg(&pm_syscall_seen, 0, 1) == 0)
+		pr_info(PM_LOG_PREFIX
+			"syscall path hook fired (first time)\n");
+	return 0;
+}
+
+static int sys_openat_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	struct syscall_match_data *d = (struct syscall_match_data *)ri->data;
+
+	d->matched = false;
+	d->needs_close = false;
+
+	/*
+	 * For openat we can only fake -ENOENT if we also have a way to
+	 * release the fd the syscall body just allocated. Without close_fd
+	 * we'd leak; bail out and let the open succeed rather than corrupt
+	 * the fd table.
+	 */
+	if (!pm_close_fd)
+		return 0;
+
+	if (!sys_path_match_user_filename(regs))
+		return 0;
+
+	d->matched = true;
+	d->needs_close = true;
 	if (atomic_cmpxchg(&pm_syscall_seen, 0, 1) == 0)
 		pr_info(PM_LOG_PREFIX
 			"syscall path hook fired (first time)\n");
@@ -605,6 +613,29 @@ static int sys_path_exit(struct kretprobe_instance *ri, struct pt_regs *regs)
 	return 0;
 }
 
+/*
+ * The probe table mirrors a small per-symbol descriptor with its own entry
+ * handler so we don't need to pull `struct kretprobe *` out of the live
+ * `struct kretprobe_instance` (which would tie us to a specific KMI).
+ */
+typedef int (*pm_syscall_entry_t)(struct kretprobe_instance *,
+				  struct pt_regs *);
+
+static struct pm_syscall_probe {
+	const char *symbol;
+	pm_syscall_entry_t entry;
+	struct kretprobe rp;
+	bool registered;
+} pm_syscall_probes[] = {
+	{ .symbol = "__arm64_sys_newfstatat", .entry = sys_path_entry   },
+	{ .symbol = "__arm64_sys_statx",      .entry = sys_path_entry   },
+	{ .symbol = "__arm64_sys_faccessat",  .entry = sys_path_entry   },
+	{ .symbol = "__arm64_sys_faccessat2", .entry = sys_path_entry   },
+	{ .symbol = "__arm64_sys_readlinkat", .entry = sys_path_entry   },
+	{ .symbol = "__arm64_sys_openat",     .entry = sys_openat_entry },
+	{ .symbol = "__arm64_sys_openat2",    .entry = sys_openat_entry },
+};
+
 static void register_syscall_hooks(void)
 {
 	unsigned int i;
@@ -614,7 +645,7 @@ static void register_syscall_hooks(void)
 		int ret;
 
 		p->rp.kp.symbol_name = p->symbol;
-		p->rp.entry_handler = sys_path_entry;
+		p->rp.entry_handler = p->entry;
 		p->rp.handler = sys_path_exit;
 		p->rp.data_size = sizeof(struct syscall_match_data);
 		p->rp.maxactive = 40;
