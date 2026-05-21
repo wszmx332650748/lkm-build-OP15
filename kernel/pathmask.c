@@ -92,9 +92,11 @@ static unsigned int deny_uid_count;
 typedef int (*pm_kern_path_t)(const char *name, unsigned int flags,
 			      struct path *path);
 typedef void (*pm_path_put_t)(const struct path *path);
+typedef int (*pm_close_fd_t)(unsigned int fd);
 
 static pm_kern_path_t pm_kern_path;
 static pm_path_put_t pm_path_put;
+static pm_close_fd_t pm_close_fd;
 
 /*
  * On Android GKI builds with CONFIG_CFI_CLANG=y the indirect call below
@@ -118,6 +120,13 @@ static int __nocfi pm_invoke_kern_path(const char *name, unsigned int flags,
 static void __nocfi pm_invoke_path_put(const struct path *path)
 {
 	pm_path_put(path);
+}
+
+static int __nocfi pm_invoke_close_fd(unsigned int fd)
+{
+	if (!pm_close_fd)
+		return -ENOSYS;
+	return pm_close_fd(fd);
 }
 
 static unsigned long resolve_kernel_symbol_addr(const char *symbol_name)
@@ -156,6 +165,16 @@ static int resolve_path_helpers(void)
 
 	if (!pm_kern_path || !pm_path_put)
 		return -ENOENT;
+
+	/*
+	 * close_fd() is needed by the openat exit hook to release the fd
+	 * that the syscall already allocated before we override the return
+	 * value to -ENOENT. It's optional: if the symbol is not resolvable
+	 * we just don't hook openat at all.
+	 */
+	if (!pm_close_fd)
+		pm_close_fd = (pm_close_fd_t)
+			resolve_kernel_symbol_addr("close_fd");
 
 	pr_info(PM_LOG_PREFIX "resolved VFS path helpers via kprobe\n");
 	return 0;
@@ -452,10 +471,11 @@ static int getattr_exit(struct kretprobe_instance *ri, struct pt_regs *regs)
 /*
  * Even though `vfs_getattr` and `inode_permission` are EXPORT_SYMBOL on GKI
  * 5.15+ and our kretprobe attaches to them, ThinLTO can still inline copies
- * of them into in-kernel callers (e.g. vfs_statx). The kallsyms entry remains
- * valid for module use, but no in-kernel call site actually goes through it,
- * so the kretprobe never fires for stat()/statx()/access(). Symbol export
- * does not imply inline immunity on LTO kernels.
+ * of them into in-kernel callers (e.g. vfs_statx, link_path_walk). The
+ * kallsyms entry remains valid for module use, but no in-kernel call site
+ * actually goes through it, so the kretprobe never fires for stat()/statx()
+ * /access()/openat()-into-target. Symbol export does not imply inline
+ * immunity on LTO kernels.
  *
  * The arm64 syscall entry stubs (`__arm64_sys_*`) are different: they are
  * stored as function pointers in `sys_call_table[]`, so the linker is forced
@@ -463,26 +483,34 @@ static int getattr_exit(struct kretprobe_instance *ri, struct pt_regs *regs)
  * of the syscall path, before any inlined VFS dispatch. Hooking them gives
  * a guaranteed interception point for the metadata-leaking syscalls.
  *
- * We deliberately do NOT hook `__arm64_sys_openat` here: kretprobe runs at
- * function exit, by which point a successful openat() has already allocated
- * an fd in the caller's table. Overriding the return value to -ENOENT would
- * leak that fd. openat() is left to the existing `inode_permission` hook,
- * which fires during path walk before the file table is touched.
+ * For openat / openat2 we additionally have to release the fd that the
+ * syscall body already allocated before we override the return value to
+ * -ENOENT. That requires close_fd(), resolved earlier via kprobe.
  */
 struct syscall_match_data {
 	bool matched;
+	bool needs_close;
+};
+
+enum pm_syscall_kind {
+	PM_SYS_PATHONLY = 0,	/* metadata-only: stat/access/readlink */
+	PM_SYS_OPENAT,		/* openat: filename in regs[1] */
+	PM_SYS_OPENAT2,		/* openat2: filename in regs[1] (same prefix) */
 };
 
 static struct pm_syscall_probe {
 	const char *symbol;
+	enum pm_syscall_kind kind;
 	struct kretprobe rp;
 	bool registered;
 } pm_syscall_probes[] = {
-	{ .symbol = "__arm64_sys_newfstatat" },
-	{ .symbol = "__arm64_sys_statx" },
-	{ .symbol = "__arm64_sys_faccessat" },
-	{ .symbol = "__arm64_sys_faccessat2" },
-	{ .symbol = "__arm64_sys_readlinkat" },
+	{ .symbol = "__arm64_sys_newfstatat", .kind = PM_SYS_PATHONLY },
+	{ .symbol = "__arm64_sys_statx",      .kind = PM_SYS_PATHONLY },
+	{ .symbol = "__arm64_sys_faccessat",  .kind = PM_SYS_PATHONLY },
+	{ .symbol = "__arm64_sys_faccessat2", .kind = PM_SYS_PATHONLY },
+	{ .symbol = "__arm64_sys_readlinkat", .kind = PM_SYS_PATHONLY },
+	{ .symbol = "__arm64_sys_openat",     .kind = PM_SYS_OPENAT  },
+	{ .symbol = "__arm64_sys_openat2",    .kind = PM_SYS_OPENAT2 },
 };
 
 static atomic_t pm_syscall_seen = ATOMIC_INIT(0);
@@ -513,10 +541,13 @@ static int sys_path_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	struct syscall_match_data *d = (struct syscall_match_data *)ri->data;
 	struct pt_regs *user_regs = (struct pt_regs *)regs->regs[0];
+	struct pm_syscall_probe *p = container_of(ri->rp,
+						  struct pm_syscall_probe, rp);
 	char buf[TARGET_TEXT_LEN];
 	long len;
 
 	d->matched = false;
+	d->needs_close = false;
 
 	if (!user_regs || !should_hide_for_current())
 		return 0;
@@ -536,6 +567,17 @@ static int sys_path_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 		return 0;
 
 	d->matched = true;
+	if (p->kind == PM_SYS_OPENAT || p->kind == PM_SYS_OPENAT2) {
+		/*
+		 * For openat we can only fake -ENOENT if we also have a way
+		 * to release the fd the syscall body just allocated. Without
+		 * close_fd we'd leak; bail out and let the open succeed
+		 * rather than corrupt the fd table.
+		 */
+		if (!pm_close_fd)
+			return 0;
+		d->needs_close = true;
+	}
 	if (atomic_cmpxchg(&pm_syscall_seen, 0, 1) == 0)
 		pr_info(PM_LOG_PREFIX
 			"syscall path hook fired (first time)\n");
@@ -545,9 +587,21 @@ static int sys_path_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 static int sys_path_exit(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	struct syscall_match_data *d = (struct syscall_match_data *)ri->data;
+	long ret = (long)regs->regs[0];
 
-	if (d->matched)
-		regs_set_return_value(regs, -ENOENT);
+	if (!d->matched)
+		return 0;
+
+	if (d->needs_close && ret >= 0) {
+		/*
+		 * The openat body succeeded and ret is the new fd. Close it
+		 * before overriding the return value, otherwise the caller
+		 * sees -ENOENT but the kernel keeps the fd allocated forever.
+		 */
+		pm_invoke_close_fd((unsigned int)ret);
+	}
+
+	regs_set_return_value(regs, -ENOENT);
 	return 0;
 }
 
