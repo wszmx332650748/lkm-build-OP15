@@ -760,24 +760,19 @@ async function refreshTargetProbe() {
 	 */
 	const probes = paths.map((rawLine) => {
 		const { path } = splitTargetLine(rawLine);
-		const shellPattern = path.replaceAll("???", "*");
-		const isGlob = /[*?[]/.test(shellPattern);
 		const tag = shellQuote(rawLine);
-		if (isGlob) {
-			// Reject patterns containing shell-active characters other
-			// than the glob metas themselves -- nobody should be
-			// putting backticks or ${} in a target path, and feeding
-			// them unquoted to the shell would be a vulnerability if
-			// somebody ever wrote to target_path.conf from a less
-			// trusted source. Render unsafe lines as MISS rather than
-			// executing them.
-			if (/[\s'"`$\\;|&><(){}\n]/.test(shellPattern)) {
-				return `echo "MISS ${shellQuote(rawLine + ' (unsafe glob)')}"`;
-			}
-			// `compgen -G` would be cleaner but isn't reliable on every
-			// Android shell; a direct glob with a no-match guard works
-			// across toybox/mksh/bash.
-			return `if ls -d ${shellPattern} >/dev/null 2>&1; then echo OK ${tag}; else echo MISS ${tag}; fi`;
+		// Detect glob metas. We do *not* attempt to expand globs in
+		// the WebUI: shell pathname expansion against /dev/<random>
+		// from an unrelated UID can interact poorly with selinux
+		// directory readability and produce confusing MISS verdicts.
+		// The kernel knows what was resolved (resolved_count sysfs
+		// param), so the UI surfaces glob lines verbatim with a
+		// DYNAMIC marker and trusts the kernel side instead.
+		if (path.indexOf("???") !== -1
+		    || path.indexOf("*") !== -1
+		    || path.indexOf("?") !== -1
+		    || path.indexOf("[") !== -1) {
+			return `echo DYNAMIC ${tag}`;
 		}
 		return `if [ -e ${shellQuote(path)} ]; then echo OK ${tag}; else echo MISS ${tag}; fi`;
 	}).join("; ");
@@ -1083,7 +1078,19 @@ for (const radio of document.querySelectorAll('input[name="scope"]')) {
 $("#denyUidsInput").addEventListener("input", updateHealthList);
 $("#waitSecondsInput").addEventListener("input", updateHealthList);
 
-runAction("正在读取配置...", refreshConfig).catch((error) => {
-	statusText.textContent = "读取失败";
-	showToast(error.message);
-});
+try {
+	runAction("正在读取配置...", refreshConfig).catch((error) => {
+		statusText.textContent = "读取失败";
+		showToast(error.message);
+	});
+} catch (error) {
+	// Synchronous failure during top-level setup. Surface it loudly
+	// so the WebUI doesn't get stuck on the HTML default status text
+	// with no clue what went wrong.
+	statusText.textContent = "脚本初始化失败";
+	if (typeof toast !== "undefined" && toast) {
+		toast.textContent = error && error.message ? error.message : String(error);
+		toast.hidden = false;
+	}
+	throw error;
+}
