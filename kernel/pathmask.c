@@ -31,6 +31,29 @@
 #define TARGET_TEXT_LEN 256
 #define UID_LIST_LEN 2048
 #define ANDROID_USER_OFFSET 100000u
+/*
+ * Android isolated UID layout (see frameworks/base android/os/Process.java):
+ *
+ *   90000 - 98999 : App Zygote isolated UIDs (FIRST/LAST_APP_ZYGOTE_ISOLATED_UID),
+ *                   used by services declared with android:useAppZygote="true".
+ *                   Each app reserves a slot of NUM_UIDS_PER_APP_ZYGOTE = 100
+ *                   UIDs in this range. Both the App Zygote process itself and
+ *                   the isolated services it forks live here -- including the
+ *                   `zygotePreloadName` callback that runs *before* the
+ *                   service is created.
+ *   99000 - 99999 : Regular isolated UIDs (FIRST/LAST_ISOLATED_UID), used by
+ *                   plain android:isolatedProcess="true" services that do not
+ *                   opt into App Zygote.
+ *
+ * Detectors such as Holmes' "Abnormal Environment (04)" run their native
+ * /proc/self/maps + linker integrity probe inside the App Zygote preload
+ * callback, on purpose: the process holds an UID in 90000-98999 which most
+ * Magisk/Zygisk denylist and unmount-based hide schemes never filter against,
+ * so /data/adb/<root>/... is still visible from there. Treating this range
+ * as "isolated" too closes that gap when scope_mode=deny is in effect.
+ */
+#define ANDROID_APP_ZYGOTE_ISOLATED_START 90000u
+#define ANDROID_APP_ZYGOTE_ISOLATED_END 98999u
 #define ANDROID_ISOLATED_START 99000u
 #define ANDROID_ISOLATED_END 99999u
 
@@ -53,7 +76,7 @@ MODULE_PARM_DESC(hide_dirents, "Hide target from getdents64 directory listings")
 
 static bool hide_isolated = true;
 module_param(hide_isolated, bool, 0644);
-MODULE_PARM_DESC(hide_isolated, "Also hide from Android isolated-process UIDs in deny scope");
+MODULE_PARM_DESC(hide_isolated, "Also hide from Android isolated-process UIDs (90000-98999 App Zygote, 99000-99999 plain isolated) in deny scope");
 
 static char scope_mode[16] = "global";
 module_param_string(scope_mode, scope_mode, sizeof(scope_mode), 0644);
@@ -224,8 +247,19 @@ static inline bool is_android_isolated_uid(uid_t uid)
 {
 	uid_t app_id = uid % ANDROID_USER_OFFSET;
 
-	return app_id >= ANDROID_ISOLATED_START &&
-	       app_id <= ANDROID_ISOLATED_END;
+	if (app_id >= ANDROID_ISOLATED_START && app_id <= ANDROID_ISOLATED_END)
+		return true;
+
+	/*
+	 * App Zygote isolated services (android:useAppZygote="true") and the
+	 * App Zygote process itself (the one that runs the zygotePreloadName
+	 * Java callback before fork) hold UIDs in 90000-98999. Detectors that
+	 * deliberately probe /proc/self/maps or the linker from inside their
+	 * own ZygotePreload land here, not in 99000-99999, so we have to
+	 * treat this range as isolated as well.
+	 */
+	return app_id >= ANDROID_APP_ZYGOTE_ISOLATED_START &&
+	       app_id <= ANDROID_APP_ZYGOTE_ISOLATED_END;
 }
 
 static inline bool should_hide_for_current(void)

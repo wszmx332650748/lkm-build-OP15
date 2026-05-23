@@ -1,3 +1,17 @@
+# PathMask 2.2.8
+
+- Fix Holmes "Abnormal Environment (04)" misdetection (and similar App Zygote-based probes that survive Zygisk Next denylist). The detector declares its `HolmesService` with `android:isolatedProcess="true" android:useAppZygote="true"` plus a `zygotePreloadName="me.garfieldhan.holmes.HolmesZygotePreload"` callback, then runs its native `preload()` integrity check (`/proc/self/maps` scan, linker / PLT-GOT inspection) inside the App Zygote process *before* the service is forked. The probe result is stashed in a static field, copy-on-write inherits it into the forked service, and Binder transaction `1625` ships the code back to `MainActivity`.
+- The kernel module's "isolated UID" check (`hide_isolated`) only covered the regular isolated range `99000-99999` (`FIRST_ISOLATED_UID` / `LAST_ISOLATED_UID` from `frameworks/base android/os/Process.java`). App Zygote isolated processes use a different range `90000-98999` (`FIRST_APP_ZYGOTE_ISOLATED_UID` / `LAST_APP_ZYGOTE_ISOLATED_UID`, with `NUM_UIDS_PER_APP_ZYGOTE = 100` per app). Without that range in `should_hide_for_current()`, the preload callback ran in deny scope but path masking did **not** kick in, so `/data/adb/...`, Zygisk shared libraries, and the configured target paths stayed visible.
+- `is_android_isolated_uid()` now matches both ranges. Existing config keeps working: enabling `hide_isolated=1` (the default) automatically covers App Zygote services without any extra UID list.
+- `deny_packages.conf` ships with `me.garfieldhan.holmes` added so the *main* (non-isolated) app process is also covered when `MainActivity` later reads back the preload state via Binder.
+
+中文说明：
+
+- 修复 Holmes "Abnormal Environment (04)" 误报（以及其它走 App Zygote 路径的检测，包括 Zygisk Next denylist 拦不住的）。Holmes 把检测服务声明为 `android:isolatedProcess="true" android:useAppZygote="true"`，再用 `zygotePreloadName="me.garfieldhan.holmes.HolmesZygotePreload"` 在 App Zygote fork 之前就调用 native `preload()` 做 `/proc/self/maps` 扫描 + linker / PLT-GOT 检测。结果落到静态字段，COW 进 service 进程，最后通过 Binder 1625 号事务返回给 `MainActivity`。
+- 内核模块原本的 "隔离 UID" 判定（`hide_isolated`）只覆盖 `99000-99999`（`FIRST_ISOLATED_UID` / `LAST_ISOLATED_UID`，见 `frameworks/base android/os/Process.java`）。App Zygote 用的是另一段 `90000-98999`（`FIRST_APP_ZYGOTE_ISOLATED_UID` / `LAST_APP_ZYGOTE_ISOLATED_UID`，每个 app 占 `NUM_UIDS_PER_APP_ZYGOTE = 100` 个 UID）。这一段没纳入 `should_hide_for_current()`，导致 deny 模式下 preload 跑的时候我们的路径隐藏完全没生效，`/data/adb/...`、Zygisk so 库以及配置的目标路径全部能被它读到。
+- `is_android_isolated_uid()` 现在两段都匹配。配置不变：开启 `hide_isolated=1`（默认开启）就自动覆盖 App Zygote 服务，不用单独加 UID。
+- `deny_packages.conf` 内置加上 `me.garfieldhan.holmes`，主进程非隔离的那一份在 `MainActivity` 通过 Binder 回读 preload 状态时也能被覆盖。
+
 # PathMask 2.2.7
 
 - Fix `cat /system_ext/app/SoterService/SoterService.apk` and other openat-based reads still succeeding even after v2.2.5/v2.2.6. The remaining gap was that `inode_permission`, while EXPORT_SYMBOL, also gets ThinLTO-inlined into `link_path_walk` itself, so the kretprobe attached to it covers some openers (those keep firing the "fired (first time)" log) but never gets called from the regular path walk that openat triggers. Reading a file *inside* a hidden directory therefore went straight through.
