@@ -776,16 +776,20 @@ async function refreshTargetProbe() {
 
 	/*
 	 * Build a probe per raw line. Three cases:
-	 *   - literal `/foo/bar`       → `[ -e /foo/bar ]`
-	 *   - glob   `/dev/???/marker` → `ls -d /dev/*/marker 2>/dev/null` (any
-	 *                                hit means the line resolves)
-	 *   - `dir:` prefix            → strip prefix, then test the path
-	 *                                that produces the parent the kernel
-	 *                                will actually hide
-	 *
-	 * `???` is our user-facing alias for `*` so it doesn't get spooked
-	 * by detector docs that only ever mention regex / fnmatch syntax.
-	 * Translate it before sending to shell.
+	 *   - literal `/foo/bar`       -> `[ -e /foo/bar ]`
+	 *   - glob   `/dev/???/marker` -> emit a DYNAMIC marker; we don't
+	 *                                expand from the WebUI because
+	 *                                shell pathname expansion against
+	 *                                /dev/<random> from an unrelated
+	 *                                UID can interact poorly with
+	 *                                selinux directory readability
+	 *                                and produce confusing MISS
+	 *                                verdicts. The kernel's
+	 *                                resolved_count sysfs param is
+	 *                                the source of truth.
+	 *   - `dir:` prefix            -> strip prefix, then test the path
+	 *                                that produces the parent the
+	 *                                kernel will actually hide.
 	 */
 	const probes = paths.map((rawLine) => {
 		const { path } = splitTargetLine(rawLine);
