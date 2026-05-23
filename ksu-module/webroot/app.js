@@ -1,3 +1,32 @@
+// Set up a global error trap before anything else. If app.js fails to
+// parse or any top-level statement throws synchronously, the WebUI
+// would otherwise stay frozen on the HTML default status text with
+// no clue what went wrong (the bottom-of-file try/catch can't catch
+// errors thrown above it). This handler writes the error directly
+// into #statusText so we can debug from the WebUI alone, without
+// needing chrome://inspect to be reachable.
+window.addEventListener("error", (event) => {
+	const msg = event && event.message ? event.message : "未知错误";
+	const where = event && event.filename
+		? `${event.filename}:${event.lineno}:${event.colno}`
+		: "";
+	const status = document.getElementById("statusText");
+	if (status) {
+		status.textContent = `脚本错误：${msg} ${where}`;
+		status.style.color = "#c01c28";
+	}
+});
+window.addEventListener("unhandledrejection", (event) => {
+	const reason = event && event.reason;
+	const msg = reason && reason.message ? reason.message
+		: typeof reason === "string" ? reason : String(reason);
+	const status = document.getElementById("statusText");
+	if (status) {
+		status.textContent = `Promise 错误：${msg}`;
+		status.style.color = "#c01c28";
+	}
+});
+
 const MODULE_ID = "pathmask";
 const LEGACY_MODULE_ID = "nohello-demo";
 const MODULE_NAME = "pathmask";

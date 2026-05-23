@@ -184,6 +184,22 @@
 	</footer>
 
 	<div id="toast" class="toast" hidden></div>
+	<script>
+		// Last-resort syntax error trap: any parse failure in app.js
+		// (or runtime error before app.js wires its own handlers) lands
+		// here. Writes the error to #statusText so the WebUI never
+		// silently freezes on the HTML default again.
+		window.addEventListener("error", function(e) {
+			var s = document.getElementById("statusText");
+			if (!s) return;
+			var msg = (e && e.message) ? e.message : "脚本错误";
+			var loc = (e && e.filename)
+				? " @ " + e.filename.replace(/^.*\//, "") + ":" + e.lineno
+				: "";
+			s.textContent = "脚本错误：" + msg + loc;
+			s.style.color = "#c01c28";
+		}, true);
+	</script>
 	<script src="./app.js"></script>
 </body>
 </html>
