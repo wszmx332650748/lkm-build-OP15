@@ -1,3 +1,23 @@
+# PathMask 2.3.3
+
+## 解决了什么
+
+- 重新设计诊断报告。之前的版本是四段 raw stdout 拼起来，开发者要从一堆数据里翻才能找到信号；用户那边看完更不知道下一步做什么。重设计后报告分五层：
+  - **结论**：一行话直说"模块为啥没加载"+ 1-3 条具体下一步建议。WebUI 诊断页顶端也直接显示这一段，用户不必复制报告就能看到。
+  - **关键事实**：模块加载状态、模块文件 sha1、KSU 启用、开机阶段、失败计数、其他 LKM 列表。每行带 ✓ ⚠ ✗ · 状态符号，扫一眼就能定位异常。
+  - **内核环境**：内核版本、KMI、OEM 后缀（自动识别 abogki / oneplus / oxygen / coloros / miui 等）、page size、SELinux、dmesg 是否可读。
+  - **配置 / 路径存在性 / 脚本日志 / dmesg pathmask 相关**：保留旧版核心信息。
+  - **原始数据**：兜底 raw dump。
+- 修复以前的"`(未生成)`"误报。OnePlus / OxygenOS 16 默认 `dmesg_restrict=1`，WebUI 跑 dmesg 会拿到 EPERM；旧版本统一显示"未生成"，让用户以为是 PathMask 本身的 bug。新版本会写明"dmesg 不可读：dmesg_restrict=1（系统锁定）"，并明确指出"不是 PathMask 的问题"。
+- 修复 `boot_state` 被诊断报告漏掉的问题。这个文件不在 `*.conf` glob 里，是 service.sh 走到哪一步的唯一信号；之前的报告完全不打印它，所以"模块没加载"类问题永远要回头让用户手动 cat。
+- 新增「行动建议」自动生成。基于事实匹配规则，不同失败模式给不同的下一步命令。常见的 7 种状况各对应一条具体建议（KSU 禁用、ko 文件丢失、连续失败保护、wait_for_targets 超时、deny 模式无 UID、boot_state 文件不存在 = service.sh 没跑、loaded 但 /proc/modules 没有等等）。
+- 新增「OEM 内核检测」。`uname -r` 包含 `abogki467167594-4k` 之类的标记时，会在「内核环境」段标注一加 / OPPO 系 GKI 改动，提示 CRC 偶发不兼容时换 SukiSU / KernelPatch 或自编内核。
+- 新增「其他 LKM 加载列表」。这一项是关键 — 能瞬间区分"PathMask 单独失败" vs "整个内核根本拒绝任何 LKM"，之前每次都得开发者多问一遍 `cat /proc/modules`。
+
+## 没改的
+
+- 内核模块、service.sh 的核心加载逻辑、所有 conf 字段格式、所有 sysfs 参数：完全不动。诊断只是观测层，不影响运行行为。
+
 # PathMask 2.3.2
 
 ## 解决了什么

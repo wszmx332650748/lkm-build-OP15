@@ -146,7 +146,16 @@ function execShell(command) {
 		window[callbackName] = (errno, stdout, stderr) => {
 			delete window[callbackName];
 			if (errno && errno !== 0) {
-				reject(new Error(stderr || stdout || `命令失败：${errno}`));
+				const err = new Error(stderr || stdout || `命令失败：${errno}`);
+				// Preserve the raw fields so callers that want to
+				// distinguish "command refused" (errno=1, stderr=
+				// 'Permission denied') from "command produced no
+				// output" can branch on them. Old callers that just
+				// look at error.message keep working.
+				err.errno = errno;
+				err.stderr = stderr || "";
+				err.stdout = stdout || "";
+				reject(err);
 				return;
 			}
 			resolve(stdout || "");
@@ -170,6 +179,29 @@ async function safeExec(command) {
 		return await execShell(command);
 	} catch (error) {
 		return `ERROR: ${error.message}`;
+	}
+}
+
+/*
+ * Variant of safeExec that returns a structured `{ ok, stdout, errno,
+ * stderr, error }` result instead of either-stdout-or-error-string.
+ * Used by the diagnostic collector so we can tell users *why* a
+ * particular probe came back empty -- "dmesg returned EPERM" is much
+ * more actionable than "(未生成)". Old call sites continue to use
+ * safeExec.
+ */
+async function probeExec(command) {
+	try {
+		const stdout = await execShell(command);
+		return { ok: true, stdout, errno: 0, stderr: "", error: "" };
+	} catch (error) {
+		return {
+			ok: false,
+			stdout: error.stdout || "",
+			stderr: error.stderr || "",
+			errno: error.errno || 1,
+			error: error.message || String(error),
+		};
 	}
 }
 
@@ -590,24 +622,564 @@ function setLogContent(key, text) {
 	renderLogPage();
 }
 
+/*
+ * Diagnostic redesign (v2.3.3+):
+ *
+ * The previous buildReport just dumped four blobs of stdout. When a
+ * user reported "module not loaded" we got a wall of text where the
+ * actual signal -- did service.sh run, what bootState did it reach,
+ * is the kernel even allowed to load LKMs, did dmesg return EPERM --
+ * was scattered across sections or simply absent. The new pipeline
+ * is three-layered:
+ *
+ *   1. gatherDiagnosticFacts(snapshot)
+ *      Runs probe-only shell, parses outputs into a structured `facts`
+ *      object that carries typed flags: `moduleLoaded` (bool),
+ *      `bootStateName` (string|null), `dmesgAvailable` (bool with
+ *      reason if not), `oemKernelTag` (string|null), etc.
+ *
+ *   2. computeVerdict(facts)
+ *      Pure JS rule engine that turns facts into a verdict string +
+ *      a list of next-step suggestions. No shell, no DOM. Each rule
+ *      is a single if/return so adding a new failure mode is one
+ *      bullet point in this function.
+ *
+ *   3. buildReport(snapshot)
+ *      Renders the report top-down: verdict -> key facts -> kernel
+ *      env -> config -> next steps -> raw dump. Raw stays for the
+ *      developer audience but is now last, not first.
+ *
+ * The verdict is also rendered into #verdictBox at the top of the
+ * Diagnosis tab so the user sees it without copying the report.
+ */
+
+const FACT_OK = "ok";
+const FACT_BAD = "bad";
+const FACT_WARN = "warn";
+const FACT_INFO = "info";
+
+const STATUS_GLYPH = {
+	[FACT_OK]: "✓",
+	[FACT_WARN]: "⚠",
+	[FACT_BAD]: "✗",
+	[FACT_INFO]: "·",
+};
+
+// Detects OEM-modded GKI build tags. When any of these appear in
+// `uname -r`, modversions CRC mismatches become substantially more
+// likely because the OEM kernel ships a private vmlinux against
+// which our DDK-built .ko was not linked. This is purely an
+// informational signal -- a clean upstream build also runs fine.
+const OEM_KERNEL_HINTS = [
+	{ pattern: /abogki/i,        vendor: "OnePlus / OPPO (ColorOS / OxygenOS)" },
+	{ pattern: /-perf\b/i,       vendor: "OEM perf build" },
+	{ pattern: /oneplus/i,       vendor: "OnePlus" },
+	{ pattern: /oxygen/i,        vendor: "OxygenOS" },
+	{ pattern: /coloros/i,       vendor: "ColorOS" },
+	{ pattern: /miui/i,          vendor: "MIUI" },
+	{ pattern: /xiaomi/i,        vendor: "Xiaomi" },
+	{ pattern: /-realme/i,       vendor: "Realme" },
+	{ pattern: /-vivo/i,         vendor: "vivo" },
+	{ pattern: /samsung|exynos/i, vendor: "Samsung / Exynos" },
+];
+
+function detectOemKernel(unameR) {
+	const text = (unameR || "").toString();
+	for (const { pattern, vendor } of OEM_KERNEL_HINTS) {
+		const m = text.match(pattern);
+		if (m) return { tag: m[0], vendor };
+	}
+	return null;
+}
+
+// Derive the GKI KMI label ("androidXX-Y.Z") from `uname -r`. Used to
+// flag a mismatch between the zip the user installed and the kernel
+// they're running on.
+function detectKmiFromUname(unameR) {
+	const m = (unameR || "").match(/(\d+)\.(\d+)\.\d+-(android\d+)/);
+	if (!m) return null;
+	return `${m[3]}-${m[1]}.${m[2]}`;
+}
+
+/*
+ * Run all probe shell in one round-trip and parse outputs into a
+ * structured facts object. Each section is delimited by a magic
+ * marker so we can split reliably even when probes fail mid-stream.
+ *
+ * Heads up: shell here is run as the WebUI shell user, which on
+ * KernelSU is root, but several probes are still gated by SELinux
+ * domain (e.g. dmesg under restrict, /sys/kernel/tainted on some
+ * builds). We capture the resulting errno + stderr via probeExec()
+ * so the verdict can distinguish "feature gone" from "no signal".
+ */
+async function gatherDiagnosticFacts(snapshot) {
+	const sep = "###PMSEP###";
+	const result = await probeExec(`
+echo ${sep}uname
+uname -r 2>&1
+echo ${sep}taint
+cat /proc/sys/kernel/tainted 2>&1
+echo ${sep}dmesgrestrict
+cat /proc/sys/kernel/dmesg_restrict 2>&1
+echo ${sep}pagesize
+getconf PAGE_SIZE 2>&1
+echo ${sep}selinux
+getenforce 2>&1
+echo ${sep}ksum
+[ -f ${shellQuote(files.ko)} ] && sha1sum ${shellQuote(files.ko)} 2>&1 | awk '{print $1}' || echo missing
+echo ${sep}kosize
+[ -f ${shellQuote(files.ko)} ] && stat -c '%s' ${shellQuote(files.ko)} 2>&1 || echo missing
+echo ${sep}allmodules
+cat /proc/modules 2>&1
+echo ${sep}dmesgall
+dmesg 2>&1 | grep -Ei 'pathmask|nohello|module_layout|disagrees|unknown symbol|invalid module|exec format' | tail -n 80
+true
+`);
+
+	const stdout = result.stdout || "";
+	const sections = {};
+	const re = new RegExp(`^${sep}(\\w+)$`);
+	let key = null;
+	const lines = stdout.split(/\r?\n/);
+	for (const line of lines) {
+		const m = line.match(re);
+		if (m) {
+			key = m[1];
+			sections[key] = "";
+			continue;
+		}
+		if (key !== null) {
+			sections[key] += (sections[key] ? "\n" : "") + line;
+		}
+	}
+
+	const trim = (s) => (s || "").trim();
+	const allModules = trim(sections.allmodules);
+	const ourModule = allModules.split(/\r?\n/).find((l) => l.startsWith("pathmask "));
+	const moduleLoaded = !!ourModule;
+	const otherLkms = allModules
+		.split(/\r?\n/)
+		.map((l) => l.split(" ")[0])
+		.filter((n) => n && n !== "pathmask" && n !== "nohello");
+
+	const dmesgRaw = trim(sections.dmesgall);
+	const dmesgRestrict = trim(sections.dmesgrestrict);
+	// dmesg_restrict=1 + empty dmesgRaw == almost certainly EPERM,
+	// not "kernel never logged anything about us". Distinguish so the
+	// report stops lying about it.
+	let dmesgState;
+	if (dmesgRaw && !/^cat:|Operation not permitted/i.test(dmesgRaw)) {
+		dmesgState = { available: true, reason: "" };
+	} else if (dmesgRestrict === "1") {
+		dmesgState = {
+			available: false,
+			reason: "dmesg_restrict=1（系统锁定，root WebUI shell 也无权读，部分 OnePlus / OEM ROM 默认如此）",
+		};
+	} else if (/Operation not permitted|Permission denied/i.test(dmesgRaw)) {
+		dmesgState = { available: false, reason: "权限被拒（SELinux 或 capabilities）" };
+	} else {
+		dmesgState = { available: false, reason: "dmesg 命令无输出" };
+	}
+
+	const koSha = trim(sections.ksum);
+	const koSize = trim(sections.kosize);
+	const unameR = trim(sections.uname);
+	const oem = detectOemKernel(unameR);
+	const kmi = detectKmiFromUname(unameR);
+
+	// Match the zip's KMI label (we don't ship it as a file, but
+	// the .ko filename in /data/adb/modules/pathmask/ is just
+	// pathmask.ko -- the zip suffix is stripped at install time. So
+	// we can only detect a mismatch by comparing the kernel's KMI
+	// to the user-pickable zip metadata, which we don't have here.
+	// Instead we surface the kernel's KMI for the user/dev to
+	// eyeball; CRC mismatch will show up as a dmesg disagrees line.)
+	let bootStateName = null;
+	let bootStateDetail = null;
+	if (snapshot.bootState && snapshot.bootState.state) {
+		bootStateName = snapshot.bootState.state;
+		bootStateDetail = snapshot.bootState.detail || null;
+	}
+
+	const failCount = Number.parseInt(firstLine(snapshot.loadFailCountText), 10) || 0;
+	const failReason = firstLine(snapshot.loadFailReasonText);
+	const koMissing = (snapshot.koInfo || "").includes("missing") ||
+		(snapshot.koInfo || "").includes("No such file");
+	const ksuDisabled = (snapshot.moduleFlags || "").includes("disable");
+
+	return {
+		moduleLoaded,
+		moduleLine: ourModule || "",
+		bootStateName,
+		bootStateDetail,
+		hasBootState: !!(snapshot.bootStateText && snapshot.bootStateText.trim()),
+		failCount,
+		failReason,
+		koMissing,
+		koSha: koSha === "missing" ? "" : koSha,
+		koSize: koSize === "missing" ? 0 : Number.parseInt(koSize, 10) || 0,
+		ksuDisabled,
+		unameR,
+		kmi,
+		oem,
+		pageSize: trim(sections.pagesize),
+		selinux: trim(sections.selinux),
+		taint: trim(sections.taint),
+		otherLkms,
+		dmesgRaw,
+		dmesgState,
+		_probeOk: result.ok,
+		_probeError: result.error,
+	};
+}
+
+/*
+ * Pure rule engine: facts -> { level, headline, suggestions[] }.
+ *
+ * Rules go top-down, first match wins. Order matters: we start from
+ * the most specific actionable cases (KSU disable flag, fail count
+ * >= 3) and end at "module not loaded for unknown reason" so the
+ * user is never told to look at "scope_mode is empty" when the
+ * actual problem is "the .ko isn't on disk".
+ */
+function computeVerdict(facts) {
+	if (facts.moduleLoaded) {
+		return {
+			level: FACT_OK,
+			headline: "PathMask 正在运行",
+			suggestions: [
+				"如果实际表现仍异常（被检测到、目标可见），用「校验配置」检查是否所有目标都被解析。",
+			],
+		};
+	}
+
+	if (facts.ksuDisabled) {
+		return {
+			level: FACT_BAD,
+			headline: "模块被 KSU 禁用",
+			suggestions: [
+				`在 KernelSU 管理器中启用 PathMask，或删除 ${MODDIR}/disable / remove。`,
+				"启用后重启或点「保存并热重载」。",
+			],
+		};
+	}
+
+	if (facts.koMissing) {
+		return {
+			level: FACT_BAD,
+			headline: "模块文件 pathmask.ko 缺失",
+			suggestions: [
+				"重新刷入对应 KMI 的 ksu zip。",
+				`确认 ${files.ko} 在重启后存在。`,
+			],
+		};
+	}
+
+	if (facts.failCount >= 3) {
+		return {
+			level: FACT_BAD,
+			headline: `连续 ${facts.failCount} 次 insmod 失败，已自动跳过加载`,
+			suggestions: [
+				facts.failReason
+					? `失败原因：${facts.failReason}`
+					: "修复底层原因（看下方建议）后再重试。",
+				"在「快速操作」点「校验配置」找具体原因；修好后用「保存并热重载」即可重置失败保护。",
+			],
+		};
+	}
+
+	if (facts.failCount >= 1) {
+		return {
+			level: FACT_WARN,
+			headline: `最近发生过 ${facts.failCount}/3 次 insmod 失败`,
+			suggestions: [
+				facts.failReason
+					? `失败原因：${facts.failReason}`
+					: "下次开机会再试一次；继续失败将触发跳过保护。",
+				"如果反复失败，多半是 KMI / OEM 内核 CRC 不兼容（看「内核环境」段）。",
+			],
+		};
+	}
+
+	if (facts.bootStateName === "skipped-targets-missing") {
+		return {
+			level: FACT_WARN,
+			headline: "service.sh 等待目标路径超时",
+			suggestions: [
+				"开机时 wait_seconds 内目标路径仍不可见，所以 service.sh 主动跳过加载（这是预期行为，不算 bug）。",
+				"重启一次通常能恢复（系统第一次冷启动挂载较慢）。",
+				`如果反复出现，把 ${CONFIGDIR}/wait_seconds.conf 调到 90 或 120 秒。`,
+			],
+		};
+	}
+
+	if (facts.bootStateName === "skipped-no-uids") {
+		return {
+			level: FACT_WARN,
+			headline: "deny 模式下没有解析到任何 UID",
+			suggestions: [
+				"deny 模式至少需要一个能解析到 UID 的应用。",
+				"在「应用黑名单」里勾上想隐藏的应用，或在「直接 UID」里手填，然后保存并重启。",
+			],
+		};
+	}
+
+	if (facts.bootStateName === "skipped-empty-targets") {
+		return {
+			level: FACT_BAD,
+			headline: "目标路径列表为空",
+			suggestions: [
+				"在「隐藏路径」里至少添加一条路径，否则模块没东西可隐藏，service.sh 会跳过加载。",
+			],
+		};
+	}
+
+	if (facts.bootStateName === "skipped-fail-guard") {
+		return {
+			level: FACT_BAD,
+			headline: "失败保护跳过加载",
+			suggestions: [
+				"清掉失败计数（点「保存并热重载」会自动清）后再试。",
+			],
+		};
+	}
+
+	if (facts.bootStateName === "skipped-legacy-loaded") {
+		return {
+			level: FACT_BAD,
+			headline: "旧 nohello 模块仍在内核里",
+			suggestions: [
+				"卸载旧的 nohello 模块再装 PathMask，或者直接在 KernelSU 管理器里把 nohello 禁用并重启。",
+			],
+		};
+	}
+
+	if (facts.bootStateName && facts.bootStateName.startsWith("failed-")) {
+		return {
+			level: FACT_BAD,
+			headline: `service.sh 报告 ${facts.bootStateName}`,
+			suggestions: [
+				`详情：${facts.bootStateDetail || "无"}`,
+				"重点看下方「dmesg pathmask 相关」段，最常见是 KMI / CRC 不匹配。",
+			],
+		};
+	}
+
+	if (facts.bootStateName === "loaded" && !facts.moduleLoaded) {
+		return {
+			level: FACT_BAD,
+			headline: "service.sh 觉得加载成功，但 /proc/modules 里没有 pathmask",
+			suggestions: [
+				"模块加载后又被卸载了，或者 insmod 返回 0 但内核拒绝了模块。",
+				"重启一次再生成诊断；仍然这样的话看「dmesg pathmask 相关」段（如果可读）。",
+			],
+		};
+	}
+
+	if (facts.bootStateName && BOOT_WAITING_STATES.has(facts.bootStateName)) {
+		return {
+			level: FACT_INFO,
+			headline: `service.sh 仍在 ${facts.bootStateName} 阶段`,
+			suggestions: [
+				"等几秒后再生成诊断，让开机脚本走完。",
+			],
+		};
+	}
+
+	if (facts.bootStateName === "paused") {
+		return {
+			level: FACT_INFO,
+			headline: "用户从 WebUI 暂停了隐藏",
+			suggestions: [
+				"点「保存并热重载」恢复。",
+			],
+		};
+	}
+
+	if (!facts.hasBootState) {
+		return {
+			level: FACT_BAD,
+			headline: "service.sh 似乎从未被调度执行",
+			suggestions: [
+				"没有 /data/adb/pathmask/boot_state 说明开机脚本根本没跑过。",
+				"先重启一次（这一类问题在 OnePlus / OxygenOS 上首次安装后很常见，重启后正常）。",
+				"重启后还是这样，确认 KSU 管理器里 PathMask 是「已启用」状态。",
+			],
+		};
+	}
+
+	return {
+		level: FACT_BAD,
+		headline: "模块未加载，原因不在已知列表里",
+		suggestions: [
+			"先重启一次（很多偶发问题靠重启就能解决）。",
+			"还有问题的话，从 root shell 跑：`insmod /data/adb/modules/pathmask/pathmask.ko ; echo exit=$?` 看完整错误，然后把这份诊断 + 这条命令的输出发给开发者。",
+		],
+	};
+}
+
+function fmtFactRow(label, level, value) {
+	const glyph = STATUS_GLYPH[level] || STATUS_GLYPH[FACT_INFO];
+	return `${label.padEnd(14, " ")}${glyph} ${value}`;
+}
+
+function buildKeyFacts(facts) {
+	const lines = [];
+	lines.push(fmtFactRow(
+		"模块加载状态",
+		facts.moduleLoaded ? FACT_OK : FACT_BAD,
+		facts.moduleLoaded ? facts.moduleLine : "未在 /proc/modules",
+	));
+	lines.push(fmtFactRow(
+		"模块文件",
+		facts.koMissing ? FACT_BAD : FACT_OK,
+		facts.koMissing
+			? `${files.ko} 缺失`
+			: `${facts.koSize} 字节, sha1=${(facts.koSha || "?").slice(0, 12)}`,
+	));
+	lines.push(fmtFactRow(
+		"KSU 启用",
+		facts.ksuDisabled ? FACT_BAD : FACT_OK,
+		facts.ksuDisabled ? "模块被禁用（disable / remove flag）" : "未被禁用",
+	));
+	if (facts.hasBootState) {
+		const detail = facts.bootStateDetail ? `（detail=${facts.bootStateDetail}）` : "";
+		lines.push(fmtFactRow(
+			"开机阶段",
+			facts.bootStateName === "loaded" && facts.moduleLoaded ? FACT_OK :
+				(facts.bootStateName && facts.bootStateName.startsWith("skipped-") ? FACT_WARN :
+					(facts.bootStateName && facts.bootStateName.startsWith("failed-") ? FACT_BAD : FACT_INFO)),
+			`${facts.bootStateName || "?"}${detail}`,
+		));
+	} else {
+		lines.push(fmtFactRow("开机阶段", FACT_BAD, "boot_state 不存在（service.sh 未执行）"));
+	}
+	const failLevel = facts.failCount >= 3 ? FACT_BAD : facts.failCount > 0 ? FACT_WARN : FACT_OK;
+	lines.push(fmtFactRow("失败计数", failLevel, `${facts.failCount} / 3${facts.failReason ? ` (${facts.failReason})` : ""}`));
+	const otherCount = facts.otherLkms.length;
+	const otherSummary = otherCount === 0
+		? "无"
+		: `${facts.otherLkms.slice(0, 5).join(", ")}${otherCount > 5 ? ` … (共 ${otherCount} 个)` : ""}`;
+	lines.push(fmtFactRow(
+		"其他 LKM",
+		otherCount > 0 ? FACT_OK : FACT_INFO,
+		otherCount > 0 ? `${otherSummary}（说明本机能加载 LKM）` : otherSummary,
+	));
+	return lines.join("\n");
+}
+
+function buildKernelEnv(facts) {
+	const lines = [];
+	lines.push(fmtFactRow("内核版本", FACT_INFO, facts.unameR || "(读不到 uname -r)"));
+	if (facts.kmi) {
+		lines.push(fmtFactRow("内核 KMI", FACT_INFO, `${facts.kmi}（请确认安装的 zip 也是这个 KMI）`));
+	}
+	if (facts.oem) {
+		lines.push(fmtFactRow(
+			"OEM 后缀",
+			FACT_WARN,
+			`${facts.oem.tag}（${facts.oem.vendor}）— OEM 改过 GKI，CRC 偶尔会不兼容；如果 dmesg 报 disagrees about version of symbol，需要换 SukiSU / KernelPatch 或自编内核`,
+		));
+	}
+	if (facts.pageSize) {
+		lines.push(fmtFactRow(
+			"Page size",
+			FACT_INFO,
+			`${facts.pageSize}（如果 insmod 报 invalid module format，多半是 page size 不一致）`,
+		));
+	}
+	if (facts.selinux) {
+		lines.push(fmtFactRow("SELinux", FACT_INFO, facts.selinux));
+	}
+	if (facts.taint) {
+		lines.push(fmtFactRow("内核污染位", facts.taint === "0" ? FACT_OK : FACT_INFO, facts.taint));
+	}
+	lines.push(fmtFactRow(
+		"dmesg 权限",
+		facts.dmesgState.available ? FACT_OK : FACT_WARN,
+		facts.dmesgState.available ? "可读" : facts.dmesgState.reason,
+	));
+	return lines.join("\n");
+}
+
 function buildReport(snapshot = lastSnapshot) {
+	const facts = snapshot.facts;
+	const verdict = snapshot.verdict;
+	if (!facts || !verdict) {
+		// First call before refreshDiagnostics has populated facts.
+		// Return a stub so the textarea isn't empty.
+		return "PathMask 诊断报告\n（点「生成诊断」后这里会出现可复制报告）";
+	}
+
 	const parts = [
 		"PathMask 诊断报告",
 		`生成时间: ${new Date().toLocaleString()}`,
+		`模块版本: ${snapshot.moduleProp || "?"}`,
 		"",
-		"=== 模块状态 ===",
-		snapshot.statusLog || "(未生成)",
+		"=== 结论 ===",
+		`${STATUS_GLYPH[verdict.level] || "·"} ${verdict.headline}`,
+		...(verdict.suggestions.length
+			? ["", "建议：", ...verdict.suggestions.map((s, i) => `  ${i + 1}. ${s}`)]
+			: []),
+		"",
+		"=== 关键事实 ===",
+		buildKeyFacts(facts),
+		"",
+		"=== 内核环境 ===",
+		buildKernelEnv(facts),
 		"",
 		"=== 配置文件 ===",
-		snapshot.configLog || "(未生成)",
+		snapshot.configLog || "(未采集)",
 		"",
 		"=== 脚本日志 logcat ===",
-		snapshot.scriptLog || "(未生成)",
+		snapshot.scriptLog && !/^ERROR:/.test(snapshot.scriptLog) && snapshot.scriptLog.trim()
+			? snapshot.scriptLog
+			: `(无 pathmask 相关 logcat${snapshot.scriptLogReason ? `；${snapshot.scriptLogReason}` : ""})`,
 		"",
-		"=== 内核日志 dmesg ===",
-		snapshot.kernelLog || "(未生成)",
+		"=== dmesg pathmask 相关 ===",
+		facts.dmesgState.available
+			? (facts.dmesgRaw || "(dmesg 中没有 pathmask 相关行)")
+			: `(dmesg 不可读：${facts.dmesgState.reason})`,
+		"",
+		"=== 原始数据 ===",
+		"--- 模块状态 ---",
+		snapshot.statusLog || "(未采集)",
 	];
 	return parts.join("\n");
+}
+
+// Render verdict + key facts directly into the Diagnosis tab so the
+// user sees actionable info without copying the report. The same
+// content is duplicated into #reportOutput for those who do copy.
+function renderVerdictPanel(snapshot) {
+	const box = $("#verdictBox");
+	if (!box) return;
+	const verdict = snapshot && snapshot.verdict;
+	const facts = snapshot && snapshot.facts;
+	if (!verdict || !facts) {
+		box.hidden = true;
+		box.textContent = "";
+		return;
+	}
+	box.hidden = false;
+	box.dataset.level = verdict.level;
+	box.textContent = "";
+
+	const head = document.createElement("div");
+	head.className = "verdictHead";
+	head.textContent = `${STATUS_GLYPH[verdict.level] || "·"}  ${verdict.headline}`;
+	box.append(head);
+
+	if (verdict.suggestions.length) {
+		const ol = document.createElement("ol");
+		ol.className = "verdictSuggestions";
+		for (const s of verdict.suggestions) {
+			const li = document.createElement("li");
+			li.textContent = s;
+			ol.append(li);
+		}
+		box.append(ol);
+	}
 }
 
 async function copyText(text) {
@@ -1137,6 +1709,16 @@ true
 	const configLog = await safeExec(`
 echo '--- persistent config ---'
 for f in ${shellQuote(CONFIGDIR)}/*.conf; do [ -f "$f" ] && echo "### $f" && cat "$f" && echo; done
+echo '--- boot state ---'
+# boot_state lives outside the *.conf glob above and is the single
+# most useful signal when the module is "just not loaded": it tells
+# us which exit branch service.sh took. Missing file means service.sh
+# never ran at all (KSU service.d scheduling issue, not a PathMask bug).
+if [ -f ${shellQuote(files.bootState)} ]; then
+  cat ${shellQuote(files.bootState)} 2>/dev/null
+else
+  echo "(no boot_state file -- service.sh did not run, or persist dir is unwritable)"
+fi
 echo '--- legacy config ---'
 for f in ${shellQuote(LEGACY_CONFIGDIR)}/*.conf; do [ -f "$f" ] && echo "### $f" && cat "$f" && echo; done
 echo '--- target existence ---'
@@ -1193,26 +1775,50 @@ fi
 true
 `);
 
-	const scriptLog = await safeExec(`logcat -d -s pathmask nohello 2>/dev/null | tail -n 300 || true`);
-	const kernelLog = await safeExec(`dmesg 2>/dev/null | grep -Ei 'pathmask|nohello|unknown symbol|invalid module|exec format|module_layout' | tail -n 240 || true`);
+	// logcat is a separate trip because on stricter ROMs it returns
+	// `Operation not permitted` -- we want to surface that distinctly
+	// from "no pathmask lines logged" instead of swallowing it.
+	const scriptProbe = await probeExec(`logcat -d -s pathmask nohello 2>&1 | tail -n 300`);
+	let scriptLog = "";
+	let scriptLogReason = "";
+	if (scriptProbe.ok) {
+		scriptLog = scriptProbe.stdout || "";
+	} else {
+		scriptLog = "";
+		scriptLogReason = `logcat 不可读（${scriptProbe.stderr || scriptProbe.error || `errno=${scriptProbe.errno}`}）`;
+	}
 
-	lastSnapshot = {
-		...lastSnapshot,
-		statusLog,
-		configLog,
-		scriptLog,
-		kernelLog,
-	};
+	const moduleProp = (firstLine(await safeExec(`grep '^version=' ${shellQuote(MODDIR + "/module.prop")} 2>/dev/null | head -n1`)) || "").replace(/^version=/, "");
+
+	// Snapshot has the latest config-driven facts; gather kernel /
+	// module / dmesg signals next, then run the verdict engine and
+	// build the layered report.
+	lastSnapshot.statusLog = statusLog;
+	lastSnapshot.configLog = configLog;
+	lastSnapshot.scriptLog = scriptLog;
+	lastSnapshot.scriptLogReason = scriptLogReason;
+	lastSnapshot.moduleProp = moduleProp;
+
+	const facts = await gatherDiagnosticFacts(lastSnapshot);
+	const verdict = computeVerdict(facts);
+
+	lastSnapshot.facts = facts;
+	lastSnapshot.verdict = verdict;
+	lastSnapshot.kernelLog = facts.dmesgState.available
+		? (facts.dmesgRaw || "(dmesg 中没有 pathmask 相关行)")
+		: `(dmesg 不可读：${facts.dmesgState.reason})`;
 
 	setLogContent("status", statusLog);
 	setLogContent("config", configLog);
-	setLogContent("script", scriptLog);
-	setLogContent("kernel", kernelLog);
+	setLogContent("script", scriptLog || `(${scriptLogReason || "无 pathmask 相关 logcat"})`);
+	setLogContent("kernel", lastSnapshot.kernelLog);
+	renderVerdictPanel(lastSnapshot);
 	lastReport = buildReport(lastSnapshot);
 	$("#reportOutput").value = lastReport;
 	statusText.textContent = "诊断已生成";
 	showToast("诊断报告已生成");
 	updateHealthList();
+}
 }
 
 function switchTab(tab) {
