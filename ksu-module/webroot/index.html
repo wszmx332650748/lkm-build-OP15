@@ -86,7 +86,11 @@
 					</label>
 				</div>
 				<label class="switchRow">
-					<span>隐藏上级目录列表项</span>
+					<span>从 ls 列表中抹掉
+						<small class="hint">
+							在父目录的 <code>ls</code> 结果里抹掉这一行（hook <code>getdents64</code>），让上级目录看起来更"干净"。<strong>不影响</strong>父目录本身是否存在，也跟下方路径行里的「父级」是两件事。
+						</small>
+					</span>
 					<input id="hideDirentsInput" type="checkbox">
 				</label>
 				<label class="switchRow">
