@@ -40,6 +40,23 @@ jobs:
       github.event_name != 'pull_request' &&
       (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     runs-on: ubuntu-latest
+    # Both `main` push and `v*` tag push race for the rolling
+    # pathmask-latest tag (force-update). When a release commit is
+    # tagged immediately after merging to main, the two publish jobs
+    # collide and one of them exits 1 on the `git push origin
+    # refs/tags/pathmask-latest --force` step, leaving a confusing red
+    # cross on the Actions dashboard. Serialise per-ref-context so
+    # only one publish-release runs at a time, and let the most
+    # recent push win when both are pending.
+    #
+    #   group:                serialises across both refs
+    #   cancel-in-progress:   when a tag push arrives while the main
+    #                         push is mid-publish, drop the main one
+    #                         (the tag push produces a strict superset
+    #                         of its outputs anyway).
+    concurrency:
+      group: publish-release
+      cancel-in-progress: true
     steps:
       - name: Checkout source code
         uses: actions/checkout@v6
